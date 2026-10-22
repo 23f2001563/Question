@@ -177,11 +177,13 @@ def task(state, decision, receipt=None, ctx=None):
     data = dict(decision)
     if receipt:
         data["receipt"] = receipt
+    states = {"completed": "TASK_STATE_COMPLETED", "input-required": "TASK_STATE_INPUT_REQUIRED",
+              "failed": "TASK_STATE_FAILED"}
     return {
-        "kind": "task", "id": str(uuid.uuid4()), "contextId": ctx or str(uuid.uuid4()),
-        "status": {"state": state, "timestamp": now()},
+        "id": str(uuid.uuid4()), "contextId": ctx or str(uuid.uuid4()),
+        "status": {"state": states.get(state, state), "timestamp": now()},
         "artifacts": [{"artifactId": str(uuid.uuid4()), "name": "invoice_decision",
-                       "parts": [{"kind": "data", "data": data}]}],
+                       "parts": [{"data": data, "mediaType": "application/json"}]}],
     }
 
 
@@ -225,12 +227,15 @@ def handle_send(request, params):
 
 # ---------- A2A endpoints ----------
 def card(request):
-    url = base_url(request) + "/a2a/"
+    url = base_url(request) + "/a2a"
     return {
         "name": "Invoice Action Agent", "description": "Reads invoice packages, proposes and executes safe payment actions with evidence.",
         "version": "1.0.0", "protocolVersion": "1.0", "url": url,
-        "supportedInterfaces": [{"url": url, "protocolBinding": "JSONRPC", "protocolVersion": "1.0"}],
-        "preferredTransport": "JSONRPC",
+        "supportedInterfaces": [
+            {"url": url, "protocolBinding": "HTTP+JSON", "protocolVersion": "1.0"},
+            {"url": url + "/", "protocolBinding": "JSONRPC", "protocolVersion": "1.0"},
+        ],
+        "preferredTransport": "HTTP+JSON",
         "capabilities": {"streaming": False, "pushNotifications": False},
         "defaultInputModes": ["text/plain", "application/json", "application/pdf", "image/png", "image/jpeg"],
         "defaultOutputModes": ["application/json"],
@@ -250,6 +255,32 @@ def root():
 @app.get("/a2a/.well-known/agent.json")
 def agent_card(request: Request):
     return card(request)
+
+
+def err(code, msg):
+    return JSONResponse({"code": code, "message": msg}, status_code=code)
+
+
+@app.post("/a2a/message:send")
+@app.post("/message:send")
+async def rest_send(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return err(400, "invalid JSON")
+    try:
+        return JSONResponse({"task": handle_send(request, body)})
+    except ValueError as e:
+        return err(400, str(e))
+    except Exception as e:
+        return err(500, "Internal error: " + str(e)[:200])
+
+
+@app.get("/a2a/tasks/{task_id}")
+@app.get("/tasks/{task_id}")
+def rest_get_task(request: Request, task_id: str):
+    t = get(f"task:{tenant_of(request, {})}:{task_id}")
+    return JSONResponse(t) if t else err(404, "Task not found")
 
 
 @app.post("/")
