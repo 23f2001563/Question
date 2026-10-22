@@ -67,6 +67,18 @@ def now():
     return datetime.now(timezone.utc).isoformat()
 
 
+def to_num(x):
+    if x is None:
+        return None
+    if isinstance(x, (int, float)):
+        return float(x)
+    t = "".join(ch for ch in str(x) if ch.isdigit() or ch in ".-")
+    try:
+        return float(t)
+    except Exception:
+        return None
+
+
 def norm(s):
     return "".join(ch for ch in str(s or "").lower() if ch.isalnum())
 
@@ -132,14 +144,25 @@ def ask_gemini(texts, files, history):
     parts = [{"text": PROMPT + "\n\nPREVIOUSLY PAID (our records):\n" + json.dumps(history)}]
     parts += [{"text": t} for t in texts]
     parts += [{"inline_data": {"mime_type": f["mime"], "data": f["b64"]}} for f in files]
-    r = requests.post(
-        f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
-        params={"key": GEMINI_KEY},
-        json={"contents": [{"parts": parts}], "generationConfig": {"responseMimeType": "application/json", "temperature": 0}},
-        timeout=90,
-    )
-    r.raise_for_status()
-    return json.loads(r.json()["candidates"][0]["content"]["parts"][0]["text"])
+    last = None
+    for model in [GEMINI_MODEL, "gemini-2.0-flash", "gemini-1.5-flash"]:
+        try:
+            r = requests.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+                params={"key": GEMINI_KEY},
+                json={"contents": [{"parts": parts}], "generationConfig": {"responseMimeType": "application/json", "temperature": 0}},
+                timeout=90,
+            )
+            if r.status_code != 200:
+                last = f"Gemini {model} HTTP {r.status_code}: {r.text[:200]}"
+                continue
+            out = json.loads(r.json()["candidates"][0]["content"]["parts"][0]["text"])
+            if isinstance(out, list):
+                out = out[0]
+            return out
+        except Exception as e:
+            last = f"Gemini {model} error: {e}"
+    raise RuntimeError(last or "Gemini failed")
 
 
 def pay(tenant, d):
@@ -158,7 +181,10 @@ def pay(tenant, d):
 def decide(tenant, texts, files):
     history = list_prefix(f"paid:{tenant}:")
     d = ask_gemini(texts, files, history)
+    if isinstance(d, list):
+        d = d[0] if d else {}
     d.setdefault("evidence", [])
+    d["amount"] = to_num(d.get("amount"))
     dup = bool(d.get("already_paid")) or bool(
         d.get("vendor") and d.get("invoice_number") and get(f"paid:{tenant}:{norm(d['vendor'])}:{norm(d['invoice_number'])}"))
     if d.get("missing_info") or d.get("amount") is None:
@@ -209,7 +235,10 @@ def handle_send(request, params):
         put(f"prop:{tenant}:{approval}", prop)
         result = task("completed", dict(prop, action="pay"), receipt, ctx)
     else:
-        d = decide(tenant, texts, files)
+        try:
+            d = decide(tenant, texts, files)
+        except Exception as e:
+            return task("failed", {"action": "request_info", "reason": "processing error: " + str(e)[:300], "evidence": []}, None, ctx)
         if d["action"] == "pay":
             result = task("completed", d, pay(tenant, d), ctx)
         elif d["action"] == "hold_for_approval":
@@ -242,6 +271,23 @@ def card(request):
         "skills": [{"id": "invoice-action", "name": "Invoice action", "description": "Decide pay / hold / reject duplicate / request info",
                     "tags": ["invoice", "payments"]}],
     }
+
+
+@app.get("/selftest")
+def selftest():
+    out = {}
+    try:
+        put("selftest", {"t": now()})
+        out["database"] = "ok " + ("postgres" if DATABASE_URL else "sqlite")
+    except Exception as e:
+        out["database"] = "ERROR: " + str(e)[:300]
+    out["gemini_key_set"] = bool(GEMINI_KEY)
+    try:
+        r = ask_gemini(["Invoice INV-9 from TestCo for 100 USD, due 2026-11-01."], [], [])
+        out["gemini"] = "ok: " + json.dumps(r)[:200]
+    except Exception as e:
+        out["gemini"] = "ERROR: " + str(e)[:300]
+    return out
 
 
 @app.get("/")
