@@ -144,8 +144,8 @@ def ask_gemini(texts, files, history):
     parts = [{"text": PROMPT + "\n\nPREVIOUSLY PAID (our records):\n" + json.dumps(history)}]
     parts += [{"text": t} for t in texts]
     parts += [{"inline_data": {"mime_type": f["mime"], "data": f["b64"]}} for f in files]
-    last = None
-    for model in [GEMINI_MODEL, "gemini-2.0-flash", "gemini-1.5-flash"]:
+    errors = []
+    for model in [GEMINI_MODEL, "gemini-2.5-flash-lite", "gemini-2.0-flash"]:
         try:
             r = requests.post(
                 f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
@@ -154,15 +154,15 @@ def ask_gemini(texts, files, history):
                 timeout=90,
             )
             if r.status_code != 200:
-                last = f"Gemini {model} HTTP {r.status_code}: {r.text[:200]}"
+                errors.append(f"{model} HTTP {r.status_code}: {r.text[:300]}")
                 continue
             out = json.loads(r.json()["candidates"][0]["content"]["parts"][0]["text"])
             if isinstance(out, list):
                 out = out[0]
             return out
         except Exception as e:
-            last = f"Gemini {model} error: {e}"
-    raise RuntimeError(last or "Gemini failed")
+            errors.append(f"{model} error: {e}")
+    raise RuntimeError(" || ".join(errors) or "Gemini failed")
 
 
 def pay(tenant, d):
@@ -283,10 +283,19 @@ def selftest():
         out["database"] = "ERROR: " + str(e)[:300]
     out["gemini_key_set"] = bool(GEMINI_KEY)
     try:
+        r = requests.get("https://generativelanguage.googleapis.com/v1beta/models", params={"key": GEMINI_KEY, "pageSize": 100}, timeout=30)
+        if r.status_code == 200:
+            out["usable_models"] = [m["name"].split("/")[-1] for m in r.json().get("models", [])
+                                    if "generateContent" in m.get("supportedGenerationMethods", [])]
+        else:
+            out["list_models_error"] = f"HTTP {r.status_code}: {r.text[:300]}"
+    except Exception as e:
+        out["list_models_error"] = str(e)[:300]
+    try:
         r = ask_gemini(["Invoice INV-9 from TestCo for 100 USD, due 2026-11-01."], [], [])
         out["gemini"] = "ok: " + json.dumps(r)[:200]
     except Exception as e:
-        out["gemini"] = "ERROR: " + str(e)[:300]
+        out["gemini"] = "ERROR: " + str(e)[:1200]
     return out
 
 
