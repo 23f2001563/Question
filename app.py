@@ -8,7 +8,7 @@ from fastapi.responses import JSONResponse
 app = FastAPI()
 
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
 APPROVAL_LIMIT = float(os.environ.get("APPROVAL_LIMIT", "10000"))  # above this -> needs approval
 DATABASE_URL = os.environ.get("DATABASE_URL", "")  # Render Postgres; if empty, uses SQLite
 DB_PATH = os.environ.get("DB_PATH", "state.db")
@@ -145,7 +145,7 @@ def ask_gemini(texts, files, history):
     parts += [{"text": t} for t in texts]
     parts += [{"inline_data": {"mime_type": f["mime"], "data": f["b64"]}} for f in files]
     errors = []
-    for model in [GEMINI_MODEL, "gemini-2.5-flash-lite", "gemini-2.0-flash"]:
+    for model in [GEMINI_MODEL, "gemini-3.5-flash", "gemini-flash-latest"]:
         try:
             r = requests.post(
                 f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
@@ -156,7 +156,9 @@ def ask_gemini(texts, files, history):
             if r.status_code != 200:
                 errors.append(f"{model} HTTP {r.status_code}: {r.text[:300]}")
                 continue
-            out = json.loads(r.json()["candidates"][0]["content"]["parts"][0]["text"])
+            ps = r.json()["candidates"][0]["content"]["parts"]
+            txt = "".join(p.get("text", "") for p in ps if not p.get("thought"))
+            out = json.loads(txt.strip().removeprefix("```json").removesuffix("```").strip())
             if isinstance(out, list):
                 out = out[0]
             return out
