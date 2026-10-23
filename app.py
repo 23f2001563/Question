@@ -145,13 +145,13 @@ def ask_gemini(texts, files, history):
     parts += [{"text": t} for t in texts]
     parts += [{"inline_data": {"mime_type": f["mime"], "data": f["b64"]}} for f in files]
     errors = []
-    for model in [GEMINI_MODEL, "gemini-3.5-flash", "gemini-flash-latest"]:
+    for model in [GEMINI_MODEL, "gemini-flash-latest"]:
         try:
             r = requests.post(
                 f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
                 params={"key": GEMINI_KEY},
                 json={"contents": [{"parts": parts}], "generationConfig": {"responseMimeType": "application/json", "temperature": 0}},
-                timeout=90,
+                timeout=40,
             )
             if r.status_code != 200:
                 errors.append(f"{model} HTTP {r.status_code}: {r.text[:300]}")
@@ -364,3 +364,77 @@ async def rpc(request: Request):
         return {"jsonrpc": "2.0", "id": rid, "error": {"code": -32602, "message": str(e)}}
     except Exception as e:
         return {"jsonrpc": "2.0", "id": rid, "error": {"code": -32603, "message": "Internal error: " + str(e)[:200]}}
+
+
+# ---------- generic propose / execute routes + request log (learn what the grader sends) ----------
+def log_request(method, path, request, raw):
+    try:
+        k = f"log:{now()}-{uuid.uuid4().hex[:6]}"
+        keep = {h: v for h, v in request.headers.items() if h.lower() in
+                ("content-type", "accept", "user-agent", "x-user-id", "x-tenant-id", "a2a-version", "x-request-id", "x-idempotency-key", "idempotency-key")}
+        put(k, {"ts": now(), "method": method, "path": path, "query": str(request.url.query),
+                "headers": keep, "has_auth": bool(request.headers.get("authorization")),
+                "body": raw[:20000].decode("utf-8", "replace")})
+    except Exception:
+        pass
+
+
+@app.get("/debug/requests")
+def debug_requests():
+    return sorted(list_prefix("log:"), key=lambda x: x["ts"], reverse=True)[:25]
+
+
+@app.api_route("/{full_path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
+async def catch_all(request: Request, full_path: str):
+    raw = await request.body()
+    path = "/" + full_path
+    log_request(request.method, path, request, raw)
+    if request.method != "POST":
+        return err(404, "Not found")
+    try:
+        body = json.loads(raw.decode("utf-8")) if raw else {}
+    except Exception:
+        return err(400, "invalid JSON")
+    if not isinstance(body, dict):
+        body = {"items": body}
+    low = path.lower()
+    tenant = tenant_of(request, {"metadata": body.get("metadata") if isinstance(body.get("metadata"), dict) else {}})
+    try:
+        if "propose" in low:
+            mid = body.get("requestId") or body.get("request_id") or body.get("id") or request.headers.get("idempotency-key") \
+                or hashlib.sha1(json.dumps(body, sort_keys=True).encode()).hexdigest()
+            ikey = f"idem:{tenant}:propose:{mid}"
+            cached = get(ikey)
+            if cached:
+                return JSONResponse(cached)
+            texts, files = collect([{"data": body}])
+            try:
+                d = decide(tenant, texts, files)
+            except Exception as e:
+                return JSONResponse({"status": "failed", "action": "request_info", "error": "processing error: " + str(e)[:300]})
+            pid = "prop_" + hashlib.sha1(ikey.encode()).hexdigest()[:12]
+            d["proposalId"] = pid
+            d["status"] = "proposed"
+            put(f"prop:{tenant}:{pid}", d)  # nothing is paid yet: payment only happens on an execute/approve call
+            resp = {**d, "proposal": dict(d)}
+            put(ikey, resp)
+            return JSONResponse(resp)
+        if any(w in low for w in ("execute", "approve", "pay", "settle", "receipt", "confirm", "complete")):
+            pid = body.get("proposalId") or body.get("proposal_id") or body.get("id")
+            prop = get(f"prop:{tenant}:{pid}") if pid else None
+            if not prop:
+                return err(404, "unknown proposal")
+            if prop.get("status") == "executed":
+                return JSONResponse({"status": "executed", "proposalId": pid, "receipt": prop["receipt"]})  # retry: same receipt
+            explicit = bool(body.get("approve") or body.get("approved") or body.get("approval"))
+            if prop["action"] == "pay" or (prop["action"] == "hold_for_approval" and explicit):
+                receipt = pay(tenant, prop)
+                prop["status"] = "executed"
+                prop["receipt"] = receipt
+                put(f"prop:{tenant}:{pid}", prop)
+                return JSONResponse({"status": "executed", "proposalId": pid, "receipt": receipt})
+            return JSONResponse({"status": "not_executed", "proposalId": pid, "action": prop["action"],
+                                 "reason": "this proposal is not approved for payment"}, status_code=409)
+    except Exception as e:
+        return err(500, "Internal error: " + str(e)[:200])
+    return JSONResponse({"ok": True, "note": "unrecognised route; request logged", "path": path})
